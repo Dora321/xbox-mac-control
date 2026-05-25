@@ -8,22 +8,21 @@ The current tool maps the Xbox controller to macOS pointer, scroll, click, and s
 - right stick: move the mouse pointer
 - right trigger: left click
 - left trigger: right click
-- hold Menu: Fn shortcut layer
+- hold B: hold `Control`.
+- X: copy
+- Y: paste
+- A: Return
+- LB: undo
+- RB: Delete, with repeat while held
 - `Control-C`: quit
 
-## Fn Shortcuts
+## Dictation
 
-Hold the Xbox Menu button, then press:
+macOS often does not allow synthetic events to behave exactly like the hardware `Fn/Globe` key. This tool can hold `Control` from the controller:
 
-- `A`: Return
-- `B`: Escape
-- `X`: Command-C
-- `Y`: Command-V
-- `LB`: Command-[
-- `RB`: Command-]
-- `View`: Control-Up
-- `L3`: Command-W
-- `R3`: Command-Tab
+1. Open `System Settings -> Keyboard -> Dictation`.
+2. If your dictation tool can use a modifier-only hotkey, set it to `Control`.
+3. Run this tool. Holding `B` holds `Control`; releasing `B` releases it.
 
 ## Requirements
 
@@ -57,7 +56,10 @@ swift run xbox-scroll --invert-mouse-y
 swift run xbox-scroll --no-horizontal
 swift run xbox-scroll --debug
 swift run xbox-scroll --input hid --debug
-swift run xbox-scroll --right-stick zrz --triggers rxry
+swift run xbox-scroll --right-stick auto
+swift run xbox-scroll --right-stick zrz
+swift run xbox-scroll --dictation-button b
+swift run xbox-scroll --diagnose --no-clicks --no-dictation
 ```
 
 Available options:
@@ -68,16 +70,20 @@ Available options:
 - `--invert-x`: reverse horizontal scrolling
 - `--invert-y`: reverse vertical scrolling
 - `--invert-mouse-x`: reverse horizontal pointer movement
-- `--invert-mouse-y`: reverse vertical pointer movement
+- `--invert-mouse-y`: reverse vertical pointer movement. The default matches this Xbox controller's `Z/Rz` right-stick direction.
 - `--no-horizontal`: only allow vertical scrolling
 - `--no-mouse`: disable right-stick pointer movement
 - `--no-clicks`: disable trigger mouse clicks
-- `--no-fn`: disable Menu-held shortcuts
+- `--no-fn`: disable dictation shortcut trigger
+- `--no-dictation`: disable dictation shortcut trigger
 - `--debug`: print live stick values and scroll deltas
+- `--diagnose`: print raw HID usage pages, usages, raw values, and normalized values
 - `--test-scroll`: post scroll events without using the controller
 - `--input <mode>`: choose `auto`, `gameController`, or `hid`, default `auto`
-- `--right-stick <pair>`: choose `xy`, `rxry`, or `zrz`, default `rxry`
-- `--triggers <pair>`: choose `xy`, `rxry`, or `zrz`, default `zrz`
+- `--right-stick <pair>`: choose `auto`, `xy`, `rxry`, or `zrz`, default `auto`
+- `--triggers <pair>`: choose `none`, `xy`, `rxry`, or `zrz`, default `none`
+- `--fn-button <button>`: alias for `--dictation-button`
+- `--dictation-button <button>`: choose which gamepad button holds `Control`: `a`, `b`, `x`, `y`, `menu`, `view`, `home`, `share`, `lb`, `rb`, `l3`, or `r3`, default `b`
 - `--tap <session|hid>`: choose the event tap target, default `session`
 - `--unit <pixel|line>`: choose scroll units, default `pixel`
 
@@ -112,8 +118,22 @@ swift run xbox-scroll --input hid --debug
 
 If `HID matched: Xbox Wireless Controller` appears but no `HID axis ...` lines appear while moving the stick, macOS is seeing the controller device but is not delivering input values to this process. Check `System Settings -> Privacy & Security -> Input Monitoring` and allow the terminal app, then unplug/reconnect the controller and rerun.
 
-If the left stick scrolls but the right stick or triggers do not behave correctly, inspect the printed `HID axis ...` lines and swap the HID axis pairs:
+For the tested Xbox Wireless Controller, macOS reports the right stick as `Z/Rz`, and the program auto-detects that pair. If the left stick scrolls but the right stick does not move the pointer, force that pair:
 
 ```sh
-swift run xbox-scroll --input hid --debug --right-stick zrz --triggers rxry
+swift run xbox-scroll --input hid --debug --right-stick zrz
 ```
+
+In debug mode, right-stick pointer movement prints `mouse gc=... hid=... move=...`. Holding the dictation button prints `Control down` and releasing it prints `Control up`. If you want to use a different gamepad button:
+
+```sh
+swift run xbox-scroll --input hid --debug --dictation-button view
+```
+
+If right-stick movement or the Fn button still cannot be identified, run diagnosis mode and move one control at a time:
+
+```sh
+swift run xbox-scroll --diagnose --no-clicks --no-dictation
+```
+
+Move the right stick in a circle, then press Menu, View, LB, RB, L3, and R3. Look for `HID value page=... usage=...` lines changing; those lines show how macOS reports the control.

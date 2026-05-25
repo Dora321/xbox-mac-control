@@ -1,4 +1,5 @@
 import ApplicationServices
+import Carbon.HIToolbox
 import CoreGraphics
 import Darwin
 import Foundation
@@ -16,12 +17,14 @@ struct ScrollConfiguration {
     var disableHorizontal = false
     var disableMouse = false
     var disableClicks = false
-    var disableFn = false
+    var disableDictation = false
     var debug = false
+    var diagnose = false
     var testScroll = false
     var inputMode: InputMode = .auto
-    var rightStick: AxisPair = .rxRy
-    var triggers: AxisPair = .zRz
+    var rightStick: AxisPair?
+    var triggers: AxisPair?
+    var dictationButton: RemoteButton = .b
     var eventTap: CGEventTapLocation = .cgSessionEventTap
     var unit: CGScrollEventUnit = .pixel
 
@@ -85,26 +88,43 @@ struct ScrollConfiguration {
                 config.disableMouse = true
             case "--no-clicks":
                 config.disableClicks = true
-            case "--no-fn":
-                config.disableFn = true
+            case "--no-fn", "--no-dictation":
+                config.disableDictation = true
             case "--debug":
                 config.debug = true
+            case "--diagnose":
+                config.debug = true
+                config.diagnose = true
             case "--test-scroll":
                 config.testScroll = true
             case "--right-stick":
                 if index + 1 < arguments.count, let pair = AxisPair(rawValue: arguments[index + 1]) {
                     config.rightStick = pair
                     index += 1
+                } else if index + 1 < arguments.count, arguments[index + 1] == "auto" {
+                    config.rightStick = nil
+                    index += 1
                 } else {
-                    print("Unknown right stick pair. Use xy, rxry, or zrz.")
+                    print("Unknown right stick pair. Use auto, xy, rxry, or zrz.")
                     printHelpAndExit(exitCode: 1)
                 }
             case "--triggers":
                 if index + 1 < arguments.count, let pair = AxisPair(rawValue: arguments[index + 1]) {
                     config.triggers = pair
                     index += 1
+                } else if index + 1 < arguments.count, arguments[index + 1] == "none" {
+                    config.triggers = nil
+                    index += 1
                 } else {
-                    print("Unknown trigger pair. Use xy, rxry, or zrz.")
+                    print("Unknown trigger pair. Use none, xy, rxry, or zrz.")
+                    printHelpAndExit(exitCode: 1)
+                }
+            case "--fn-button", "--dictation-button":
+                if index + 1 < arguments.count, let button = RemoteButton(fnRawValue: arguments[index + 1]) {
+                    config.dictationButton = button
+                    index += 1
+                } else {
+                    print("Unknown dictation button. Use a, b, x, y, menu, view, home, share, lb, rb, l3, or r3.")
                     printHelpAndExit(exitCode: 1)
                 }
             case "--input":
@@ -171,8 +191,13 @@ final class ControllerScrollApp: @unchecked Sendable {
     private var residualMouseY: Double = 0
     private var leftMouseDown = false
     private var rightMouseDown = false
-    private var previousButtons = Set<UInt32>()
+    private var previousButtons = Set<RemoteButton>()
+    private var previousActionButtons = Set<RemoteButton>()
+    private var optionCommandDown = false
+    private var lastDeleteRepeat = Date.distantPast
+    private var deleteHoldStartedAt: Date?
     private var lastDebugPrint = Date.distantPast
+    private var lastMouseDebugPrint = Date.distantPast
     private var scanTimer: Timer?
     private var scrollTimer: Timer?
 
@@ -192,11 +217,14 @@ final class ControllerScrollApp: @unchecked Sendable {
 
         GCController.shouldMonitorBackgroundEvents = true
         GCController.startWirelessControllerDiscovery()
-        hidReader.start(debug: config.debug)
+        hidReader.start(debug: config.debug, diagnose: config.diagnose)
 
         print("Xbox scroll controller is running.")
         print("Move the left stick to scroll. Press Control-C to quit.")
-        print("speed=\(Int(config.speed)), deadzone=\(String(format: "%.2f", config.deadzone)), input=\(config.inputMode.rawValue), tap=\(tapName), unit=\(unitName)")
+        print("speed=\(Int(config.speed)), mouseSpeed=\(Int(config.mouseSpeed)), deadzone=\(String(format: "%.2f", config.deadzone)), input=\(config.inputMode.rawValue), dictation=\(config.dictationButton.name) -> hold Control, tap=\(tapName), unit=\(unitName)")
+        if config.diagnose {
+            print("Diagnose mode: move the right stick and press candidate Fn buttons. Watch for HID value/page lines and buttons=[...].")
+        }
 
         scanForController()
         scanTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
@@ -211,6 +239,7 @@ final class ControllerScrollApp: @unchecked Sendable {
         scanTimer?.invalidate()
         scrollTimer?.invalidate()
         releaseMouseButtons()
+        setControl(down: false)
         GCController.stopWirelessControllerDiscovery()
         hidReader.stop()
         print("\nStopped.")
@@ -272,11 +301,12 @@ final class ControllerScrollApp: @unchecked Sendable {
         emitScrollIfNeeded()
         emitMouseMoveIfNeeded()
         emitClicksIfNeeded()
-        emitFnShortcutsIfNeeded()
+        emitDictationShortcutIfNeeded()
+        emitActionButtonsIfNeeded()
     }
 
     private func emitScrollIfNeeded() {
-        let hidAxes = hidReader.axes
+        let hidAxes = hidReader.axes(pair: .xY)
         let selectedAxes = selectAxes(gameController: (xAxis, yAxis), hid: hidAxes)
         let x = filteredAxis(selectedAxes.x)
         let y = filteredAxis(selectedAxes.y)
@@ -343,7 +373,7 @@ final class ControllerScrollApp: @unchecked Sendable {
             return
         }
 
-        let hidRightAxes = hidReader.axes(pair: config.rightStick)
+        let hidRightAxes = hidReader.axesForPointer(configuredPair: config.rightStick, triggerPair: config.triggers)
         let selectedAxes = selectAxes(gameController: (rightXAxis, rightYAxis), hid: hidRightAxes)
         let x = filteredAxis(selectedAxes.x)
         let y = filteredAxis(selectedAxes.y)
@@ -351,11 +381,22 @@ final class ControllerScrollApp: @unchecked Sendable {
         guard x != 0 || y != 0 else {
             residualMouseX = 0
             residualMouseY = 0
+            printMouseDebugIfNeeded(
+                gameControllerX: rightXAxis,
+                gameControllerY: rightYAxis,
+                hidX: hidRightAxes.x,
+                hidY: hidRightAxes.y,
+                source: selectedAxes.source,
+                filteredX: x,
+                filteredY: y,
+                dx: 0,
+                dy: 0
+            )
             return
         }
 
         let horizontalSign = config.invertMouseX ? -1.0 : 1.0
-        let verticalSign = config.invertMouseY ? 1.0 : -1.0
+        let verticalSign = config.invertMouseY ? -1.0 : 1.0
 
         residualMouseX += Double(x) * config.mouseSpeed * horizontalSign
         residualMouseY += Double(y) * config.mouseSpeed * verticalSign
@@ -364,10 +405,32 @@ final class ControllerScrollApp: @unchecked Sendable {
         let dy = takeWholePixels(from: &residualMouseY)
 
         guard dx != 0 || dy != 0 else {
+            printMouseDebugIfNeeded(
+                gameControllerX: rightXAxis,
+                gameControllerY: rightYAxis,
+                hidX: hidRightAxes.x,
+                hidY: hidRightAxes.y,
+                source: selectedAxes.source,
+                filteredX: x,
+                filteredY: y,
+                dx: 0,
+                dy: 0
+            )
             return
         }
 
         moveMouseBy(x: CGFloat(dx), y: CGFloat(dy))
+        printMouseDebugIfNeeded(
+            gameControllerX: rightXAxis,
+            gameControllerY: rightYAxis,
+            hidX: hidRightAxes.x,
+            hidY: hidRightAxes.y,
+            source: selectedAxes.source,
+            filteredX: x,
+            filteredY: y,
+            dx: dx,
+            dy: dy
+        )
     }
 
     private func emitClicksIfNeeded() {
@@ -376,7 +439,7 @@ final class ControllerScrollApp: @unchecked Sendable {
             return
         }
 
-        let hidTriggers = hidReader.axes(pair: config.triggers)
+        let hidTriggers = config.triggers.map { hidReader.axes(pair: $0) } ?? (x: 0, y: 0)
         let leftPressed = isTriggerPressed(gameControllerValue: leftTrigger, hidValue: hidTriggers.x)
         let rightPressed = isTriggerPressed(gameControllerValue: rightTrigger, hidValue: hidTriggers.y)
 
@@ -384,51 +447,120 @@ final class ControllerScrollApp: @unchecked Sendable {
         setMouseButton(.left, down: rightPressed)
     }
 
-    private func emitFnShortcutsIfNeeded() {
-        guard !config.disableFn else {
-            previousButtons = hidReader.buttons
-            return
-        }
-
-        let buttons = hidReader.buttons
-        let fnHeld = buttons.contains(XboxHIDButton.menu.rawValue)
+    private func emitDictationShortcutIfNeeded() {
+        let buttons = currentRemoteButtons()
         defer {
             previousButtons = buttons
         }
 
-        guard fnHeld else {
+        guard !config.disableDictation else {
             return
         }
 
-        let newlyPressed = buttons.subtracting(previousButtons)
-        for button in newlyPressed where button != XboxHIDButton.menu.rawValue {
-            handleFnButton(button)
-        }
+        setControl(down: buttons.contains(config.dictationButton))
     }
 
-    private func handleFnButton(_ button: UInt32) {
-        switch XboxHIDButton(rawValue: button) {
+    private func emitActionButtonsIfNeeded() {
+        let buttons = currentRemoteButtons()
+        defer {
+            previousActionButtons = buttons
+        }
+
+        for button in buttons.subtracting(previousActionButtons) {
+            handleActionButton(button)
+        }
+
+        handleDeleteRepeat(isPressed: buttons.contains(.rightShoulder))
+    }
+
+    private func handleActionButton(_ button: RemoteButton) {
+        switch button {
         case .a:
             postKey(.returnKey)
-        case .b:
-            postKey(.escape)
+            printActionDebug("A -> Return")
         case .x:
-            postKey(.c, flags: .maskCommand)
-        case .y:
             postKey(.v, flags: .maskCommand)
+            printActionDebug("X -> Command-V")
+        case .y:
+            postKey(.c, flags: .maskCommand)
+            printActionDebug("Y -> Command-C")
         case .leftShoulder:
-            postKey(.leftBracket, flags: .maskCommand)
+            postKey(.z, flags: .maskCommand)
+            printActionDebug("LB -> Command-Z")
         case .rightShoulder:
-            postKey(.rightBracket, flags: .maskCommand)
-        case .view:
-            postKey(.upArrow, flags: .maskControl)
-        case .leftThumbstick:
-            postKey(.w, flags: .maskCommand)
-        case .rightThumbstick:
-            postKey(.tab, flags: .maskCommand)
+            postKey(.delete)
+            printActionDebug("RB -> Delete")
         default:
             break
         }
+    }
+
+    private func handleDeleteRepeat(isPressed: Bool) {
+        guard isPressed else {
+            deleteHoldStartedAt = nil
+            lastDeleteRepeat = .distantPast
+            return
+        }
+
+        let now = Date()
+        if deleteHoldStartedAt == nil {
+            deleteHoldStartedAt = now
+            lastDeleteRepeat = now
+            return
+        }
+
+        guard let startedAt = deleteHoldStartedAt, now.timeIntervalSince(startedAt) >= 0.35 else {
+            return
+        }
+
+        guard now.timeIntervalSince(lastDeleteRepeat) >= 0.06 else {
+            return
+        }
+
+        lastDeleteRepeat = now
+        postKey(.delete)
+        printActionDebug("RB -> Delete repeat")
+    }
+
+    private func printActionDebug(_ message: String) {
+        guard config.debug else {
+            return
+        }
+
+        print("Action: \(message)")
+    }
+
+    private func currentRemoteButtons() -> Set<RemoteButton> {
+        var buttons = Set<RemoteButton>()
+
+        for button in hidReader.buttons {
+            if let remoteButton = RemoteButton(hidUsage: button) {
+                buttons.insert(remoteButton)
+            }
+        }
+
+        if let gamepad = activeController?.extendedGamepad {
+            if gamepad.buttonA.isPressed { buttons.insert(.a) }
+            if gamepad.buttonB.isPressed { buttons.insert(.b) }
+            if gamepad.buttonX.isPressed { buttons.insert(.x) }
+            if gamepad.buttonY.isPressed { buttons.insert(.y) }
+            if gamepad.leftShoulder.isPressed { buttons.insert(.leftShoulder) }
+            if gamepad.rightShoulder.isPressed { buttons.insert(.rightShoulder) }
+            if gamepad.leftThumbstickButton?.isPressed == true { buttons.insert(.leftThumbstick) }
+            if gamepad.rightThumbstickButton?.isPressed == true { buttons.insert(.rightThumbstick) }
+            if gamepad.buttonMenu.isPressed { buttons.insert(.menu) }
+            if gamepad.buttonOptions?.isPressed == true { buttons.insert(.view) }
+            if gamepad.buttonHome?.isPressed == true { buttons.insert(.home) }
+            if let xboxGamepad = gamepad as? GCXboxGamepad, xboxGamepad.buttonShare?.isPressed == true {
+                buttons.insert(.share)
+            }
+        }
+
+        if config.debug, !buttons.isEmpty {
+            printRemoteButtonsIfNeeded(buttons)
+        }
+
+        return buttons
     }
 
     private func selectAxes(
@@ -474,6 +606,8 @@ final class ControllerScrollApp: @unchecked Sendable {
 
         let current = mouseEvent.location
         let destination = CGPoint(x: current.x + x, y: current.y + y)
+        CGWarpMouseCursorPosition(destination)
+        CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
         postMouseEvent(type: .mouseMoved, at: destination, button: .left)
     }
 
@@ -524,6 +658,32 @@ final class ControllerScrollApp: @unchecked Sendable {
         up.post(tap: config.eventTap)
     }
 
+    private func setControl(down: Bool) {
+        guard down != optionCommandDown else {
+            return
+        }
+
+        optionCommandDown = down
+        if down {
+            postModifier(.control, down: true, flags: .maskControl)
+        } else {
+            postModifier(.control, down: false, flags: [])
+        }
+
+        if config.debug {
+            print("Control \(down ? "down" : "up") via \(config.dictationButton.name)")
+        }
+    }
+
+    private func postModifier(_ key: ModifierKey, down: Bool, flags: CGEventFlags) {
+        guard let event = CGEvent(keyboardEventSource: nil, virtualKey: key.rawValue, keyDown: down) else {
+            return
+        }
+
+        event.flags = flags
+        event.post(tap: config.eventTap)
+    }
+
     private func postTestScroll() {
         print("Move the pointer over a scrollable area. Test starts in 3 seconds...")
         RunLoop.current.run(until: Date().addingTimeInterval(3))
@@ -549,6 +709,10 @@ final class ControllerScrollApp: @unchecked Sendable {
             return
         }
 
+        if config.diagnose, horizontal == 0, vertical == 0 {
+            return
+        }
+
         let now = Date()
         guard now.timeIntervalSince(lastDebugPrint) >= 0.2 else {
             return
@@ -569,6 +733,58 @@ final class ControllerScrollApp: @unchecked Sendable {
                 vertical
             )
         )
+    }
+
+    private func printMouseDebugIfNeeded(
+        gameControllerX: Float,
+        gameControllerY: Float,
+        hidX: Float,
+        hidY: Float,
+        source: String,
+        filteredX: Float,
+        filteredY: Float,
+        dx: Int32,
+        dy: Int32
+    ) {
+        guard config.debug else {
+            return
+        }
+
+        if config.diagnose, dx == 0, dy == 0 {
+            return
+        }
+
+        let now = Date()
+        guard now.timeIntervalSince(lastMouseDebugPrint) >= 0.2 else {
+            return
+        }
+
+        lastMouseDebugPrint = now
+        print(
+            String(
+                format: "mouse gc=(%.3f, %.3f) hid=(%.3f, %.3f) source=%@ filtered=(%.3f, %.3f) move=(%d, %d)",
+                gameControllerX,
+                gameControllerY,
+                hidX,
+                hidY,
+                source,
+                filteredX,
+                filteredY,
+                dx,
+                dy
+            )
+        )
+    }
+
+    private func printRemoteButtonsIfNeeded(_ buttons: Set<RemoteButton>) {
+        let now = Date()
+        guard now.timeIntervalSince(lastDebugPrint) >= 0.2 else {
+            return
+        }
+
+        lastDebugPrint = now
+        let names = buttons.map(\.name).sorted().joined(separator: ",")
+        print("buttons=[\(names)]")
     }
 
     private func filteredAxis(_ value: Float) -> Float {
@@ -610,7 +826,10 @@ final class HIDGamepadReader {
     private var buttonValues = Set<UInt32>()
     private var lastAxisDebugPrint: [UInt32: Date] = [:]
     private var lastButtonDebugPrint: [UInt32: Date] = [:]
+    private var lastDiagnosticRawValues: [String: Int] = [:]
+    private var lastDiagnosticPrint: [String: Date] = [:]
     private var debug = false
+    private var diagnose = false
 
     var buttons: Set<UInt32> {
         buttonValues
@@ -640,8 +859,44 @@ final class HIDGamepadReader {
         )
     }
 
-    func start(debug: Bool) {
+    func axesForPointer(
+        configuredPair: ScrollConfiguration.AxisPair?,
+        triggerPair: ScrollConfiguration.AxisPair?
+    ) -> (x: Float, y: Float) {
+        if let configuredPair {
+            return axes(pair: configuredPair)
+        }
+
+        let candidates = axisPairs.filter { pair in
+            if pair.x == UInt32(kHIDUsage_GD_X) || pair.y == UInt32(kHIDUsage_GD_Y) {
+                return false
+            }
+
+            guard let triggerPair else {
+                return true
+            }
+
+            let triggerUsages = triggerPair.usages
+            return pair.x != triggerUsages.x && pair.y != triggerUsages.y
+        }
+
+        if let activePair = candidates.max(by: { magnitude($0) < magnitude($1) }), magnitude(activePair) > 0.02 {
+            return (
+                axisValues[activePair.x] ?? 0,
+                axisValues[activePair.y] ?? 0
+            )
+        }
+
+        let fallback = ScrollConfiguration.AxisPair.rxRy.usages
+        return (
+            axisValues[fallback.x] ?? 0,
+            axisValues[fallback.y] ?? 0
+        )
+    }
+
+    func start(debug: Bool, diagnose: Bool) {
         self.debug = debug
+        self.diagnose = diagnose
 
         let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
         self.manager = manager
@@ -697,6 +952,8 @@ final class HIDGamepadReader {
         let element = IOHIDValueGetElement(value)
         let usagePage = IOHIDElementGetUsagePage(element)
         let usage = IOHIDElementGetUsage(element)
+
+        printDiagnosticValueIfNeeded(value: value, element: element, usagePage: usagePage, usage: usage)
 
         if usagePage == UInt32(kHIDPage_Button) {
             handleButton(usage: usage, pressed: IOHIDValueGetIntegerValue(value) != 0)
@@ -786,6 +1043,47 @@ final class HIDGamepadReader {
         print("HID button \(name) \(pressed ? "down" : "up")")
     }
 
+    private func printDiagnosticValueIfNeeded(
+        value: IOHIDValue,
+        element: IOHIDElement,
+        usagePage: UInt32,
+        usage: UInt32
+    ) {
+        guard diagnose else {
+            return
+        }
+
+        let rawValue = IOHIDValueGetIntegerValue(value)
+        let key = "\(usagePage):\(usage)"
+
+        if lastDiagnosticRawValues[key] == rawValue {
+            return
+        }
+
+        let now = Date()
+        if let lastPrint = lastDiagnosticPrint[key], now.timeIntervalSince(lastPrint) < 0.08 {
+            return
+        }
+
+        lastDiagnosticRawValues[key] = rawValue
+        lastDiagnosticPrint[key] = now
+
+        let minValue = IOHIDElementGetLogicalMin(element)
+        let maxValue = IOHIDElementGetLogicalMax(element)
+        let normalized = normalize(value: value, element: element)
+        print(
+            String(
+                format: "HID value page=%@ usage=%@ raw=%ld min=%ld max=%ld normalized=%.3f",
+                pageName(usagePage),
+                usageName(page: usagePage, usage: usage),
+                rawValue,
+                minValue,
+                maxValue,
+                normalized
+            )
+        )
+    }
+
     private var axisPairs: [(x: UInt32, y: UInt32)] {
         [
             (UInt32(kHIDUsage_GD_X), UInt32(kHIDUsage_GD_Y)),
@@ -800,8 +1098,40 @@ final class HIDGamepadReader {
         UInt32(kHIDUsage_GD_Z): "Z",
         UInt32(kHIDUsage_GD_Rx): "Rx",
         UInt32(kHIDUsage_GD_Ry): "Ry",
-        UInt32(kHIDUsage_GD_Rz): "Rz"
+            UInt32(kHIDUsage_GD_Rz): "Rz"
     ]
+
+    private func pageName(_ page: UInt32) -> String {
+        switch page {
+        case UInt32(kHIDPage_GenericDesktop):
+            return "GenericDesktop(0x01)"
+        case UInt32(kHIDPage_Button):
+            return "Button(0x09)"
+        case UInt32(kHIDPage_Consumer):
+            return "Consumer(0x0c)"
+        default:
+            return String(format: "0x%02x", page)
+        }
+    }
+
+    private func usageName(page: UInt32, usage: UInt32) -> String {
+        if page == UInt32(kHIDPage_GenericDesktop), let name = Self.axisUsageNames[usage] {
+            return "\(name)(\(usage))"
+        }
+
+        if page == UInt32(kHIDPage_Button) {
+            let name = XboxHIDButton(rawValue: usage)?.name ?? "button\(usage)"
+            return "\(name)(\(usage))"
+        }
+
+        return String(format: "0x%02x", usage)
+    }
+
+    private func magnitude(_ pair: (x: UInt32, y: UInt32)) -> Float {
+        let xValue = axisValues[pair.x] ?? 0
+        let yValue = axisValues[pair.y] ?? 0
+        return max(abs(xValue), abs(yValue))
+    }
 
     private static let deviceMatched: IOHIDDeviceCallback = { context, _, _, device in
         guard let context else {
@@ -822,17 +1152,77 @@ final class HIDGamepadReader {
     }
 }
 
-enum XboxHIDButton: UInt32 {
-    case a = 1
-    case b = 2
-    case x = 3
-    case y = 4
-    case leftShoulder = 5
-    case rightShoulder = 6
-    case view = 7
-    case menu = 8
-    case leftThumbstick = 9
-    case rightThumbstick = 10
+enum RemoteButton: Hashable {
+    case a
+    case b
+    case x
+    case y
+    case leftShoulder
+    case rightShoulder
+    case view
+    case menu
+    case home
+    case share
+    case leftThumbstick
+    case rightThumbstick
+
+    init?(hidUsage: UInt32) {
+        switch hidUsage {
+        case 1:
+            self = .a
+        case 2:
+            self = .b
+        case 3:
+            self = .x
+        case 4:
+            self = .y
+        case 7:
+            self = .leftShoulder
+        case 8:
+            self = .rightShoulder
+        case 9:
+            self = .leftThumbstick
+        case 10:
+            self = .rightThumbstick
+        case 11:
+            self = .view
+        case 12:
+            self = .menu
+        default:
+            return nil
+        }
+    }
+
+    init?(fnRawValue: String) {
+        switch fnRawValue {
+        case "a":
+            self = .a
+        case "b":
+            self = .b
+        case "x":
+            self = .x
+        case "y":
+            self = .y
+        case "menu":
+            self = .menu
+        case "view":
+            self = .view
+        case "home":
+            self = .home
+        case "share":
+            self = .share
+        case "lb":
+            self = .leftShoulder
+        case "rb":
+            self = .rightShoulder
+        case "l3":
+            self = .leftThumbstick
+        case "r3":
+            self = .rightThumbstick
+        default:
+            return nil
+        }
+    }
 
     var name: String {
         switch self {
@@ -852,6 +1242,10 @@ enum XboxHIDButton: UInt32 {
             return "View"
         case .menu:
             return "Menu/Fn"
+        case .home:
+            return "Home"
+        case .share:
+            return "Share"
         case .leftThumbstick:
             return "L3"
         case .rightThumbstick:
@@ -860,10 +1254,29 @@ enum XboxHIDButton: UInt32 {
     }
 }
 
+enum XboxHIDButton: UInt32 {
+    case a = 1
+    case b = 2
+    case x = 3
+    case y = 4
+    case leftThumbstick = 9
+    case rightThumbstick = 10
+    case view = 11
+    case menu = 12
+    case leftShoulder = 7
+    case rightShoulder = 8
+
+    var name: String {
+        RemoteButton(hidUsage: rawValue)?.name ?? "button\(rawValue)"
+    }
+}
+
 enum KeyCode: CGKeyCode {
     case a = 0
+    case d = 2
     case c = 8
     case v = 9
+    case z = 6
     case w = 13
     case tab = 48
     case returnKey = 36
@@ -871,6 +1284,13 @@ enum KeyCode: CGKeyCode {
     case leftBracket = 33
     case rightBracket = 30
     case upArrow = 126
+    case delete = 51
+}
+
+enum ModifierKey: CGKeyCode {
+    case control = 0x3B
+    case command = 0x37
+    case option = 0x3A
 }
 
 private func requestAccessibilityPermissionIfNeeded() {
@@ -902,12 +1322,17 @@ private func printHelpAndExit(exitCode: Int32 = 0) -> Never {
           --no-horizontal       Disable horizontal scrolling
           --no-mouse            Disable right-stick pointer movement
           --no-clicks           Disable trigger mouse clicks
-          --no-fn               Disable Menu-held shortcut layer
+          --no-fn               Disable dictation shortcut trigger
+          --no-dictation        Disable dictation shortcut trigger
           --debug               Print live stick values and scroll deltas
+          --diagnose            Print raw HID values for mapping unknown controls
           --test-scroll         Post scroll events without using the controller
           --input <mode>        Input source: auto, gameController, or hid. Default: auto
-          --right-stick <pair>  Right stick HID axis pair: xy, rxry, or zrz. Default: rxry
-          --triggers <pair>     Trigger HID axis pair: xy, rxry, or zrz. Default: zrz
+          --right-stick <pair>  Right stick HID axis pair: auto, xy, rxry, or zrz. Default: auto
+          --triggers <pair>     Trigger HID axis pair: none, xy, rxry, or zrz. Default: none
+          --fn-button <button>  Alias for --dictation-button
+          --dictation-button <button>
+                                Gamepad button that holds Control. Default: b
           --tap <session|hid>   Event tap target. Default: session
           --unit <pixel|line>   Scroll units. Default: pixel
           -h, --help            Show this help
