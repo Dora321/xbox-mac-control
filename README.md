@@ -14,7 +14,11 @@ The current tool maps the Xbox controller to macOS pointer, scroll, click, and s
 - A: Return
 - LB: undo
 - RB: Delete, with repeat while held
+- D-pad left/right: switch macOS desktops/spaces
 - `Control-C`: quit
+
+Desktop switching uses macOS System Events to send `Control-Left` and `Control-Right`.
+If macOS asks for Automation or Accessibility permission for your terminal app, allow it.
 
 ## Dictation
 

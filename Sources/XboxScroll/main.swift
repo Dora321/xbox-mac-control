@@ -490,6 +490,20 @@ final class ControllerScrollApp: @unchecked Sendable {
         case .rightShoulder:
             postKey(.delete)
             printActionDebug("RB -> Delete")
+        case .dpadLeft:
+            guard isDpadSpaceSwitchAllowed() else {
+                printActionDebug("D-pad left ignored while stick is active")
+                break
+            }
+            switchSpace(with: .leftArrow)
+            printActionDebug("D-pad left -> Control-Left")
+        case .dpadRight:
+            guard isDpadSpaceSwitchAllowed() else {
+                printActionDebug("D-pad right ignored while stick is active")
+                break
+            }
+            switchSpace(with: .rightArrow)
+            printActionDebug("D-pad right -> Control-Right")
         default:
             break
         }
@@ -538,12 +552,15 @@ final class ControllerScrollApp: @unchecked Sendable {
                 buttons.insert(remoteButton)
             }
         }
-
         if let gamepad = activeController?.extendedGamepad {
             if gamepad.buttonA.isPressed { buttons.insert(.a) }
             if gamepad.buttonB.isPressed { buttons.insert(.b) }
             if gamepad.buttonX.isPressed { buttons.insert(.x) }
             if gamepad.buttonY.isPressed { buttons.insert(.y) }
+            if isDpadSpaceSwitchAllowed() {
+                if gamepad.dpad.left.isPressed { buttons.insert(.dpadLeft) }
+                if gamepad.dpad.right.isPressed { buttons.insert(.dpadRight) }
+            }
             if gamepad.leftShoulder.isPressed { buttons.insert(.leftShoulder) }
             if gamepad.rightShoulder.isPressed { buttons.insert(.rightShoulder) }
             if gamepad.leftThumbstickButton?.isPressed == true { buttons.insert(.leftThumbstick) }
@@ -561,6 +578,28 @@ final class ControllerScrollApp: @unchecked Sendable {
         }
 
         return buttons
+    }
+
+    private func isDpadSpaceSwitchAllowed() -> Bool {
+        if abs(xAxis) > config.deadzone || abs(yAxis) > config.deadzone {
+            return false
+        }
+
+        if abs(rightXAxis) > config.deadzone || abs(rightYAxis) > config.deadzone {
+            return false
+        }
+
+        let hidLeftAxes = hidReader.axes(pair: .xY)
+        if abs(hidLeftAxes.x) > config.deadzone || abs(hidLeftAxes.y) > config.deadzone {
+            return false
+        }
+
+        let hidRightAxes = hidReader.axesForPointer(configuredPair: config.rightStick, triggerPair: config.triggers)
+        if abs(hidRightAxes.x) > config.deadzone || abs(hidRightAxes.y) > config.deadzone {
+            return false
+        }
+
+        return true
     }
 
     private func selectAxes(
@@ -644,7 +683,7 @@ final class ControllerScrollApp: @unchecked Sendable {
         event.post(tap: config.eventTap)
     }
 
-    private func postKey(_ key: KeyCode, flags: CGEventFlags = []) {
+    private func postKey(_ key: KeyCode, flags: CGEventFlags = [], tap: CGEventTapLocation? = nil) {
         guard
             let down = CGEvent(keyboardEventSource: nil, virtualKey: key.rawValue, keyDown: true),
             let up = CGEvent(keyboardEventSource: nil, virtualKey: key.rawValue, keyDown: false)
@@ -654,8 +693,45 @@ final class ControllerScrollApp: @unchecked Sendable {
 
         down.flags = flags
         up.flags = flags
-        down.post(tap: config.eventTap)
-        up.post(tap: config.eventTap)
+        down.post(tap: tap ?? config.eventTap)
+        up.post(tap: tap ?? config.eventTap)
+    }
+
+    private func postControlArrow(_ key: KeyCode) {
+        let tap = CGEventTapLocation.cghidEventTap
+        postModifier(.control, down: true, flags: .maskControl, tap: tap)
+        usleep(12_000)
+        postKey(key, flags: .maskControl, tap: tap)
+        usleep(12_000)
+        postModifier(.control, down: false, flags: [], tap: tap)
+    }
+
+    private func switchSpace(with key: KeyCode) {
+        if postControlArrowViaSystemEvents(key) {
+            return
+        }
+
+        postControlArrow(key)
+    }
+
+    private func postControlArrowViaSystemEvents(_ key: KeyCode) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = [
+            "-e",
+            "tell application \"System Events\" to key code \(Int(key.rawValue)) using control down"
+        ]
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus == 0
+        } catch {
+            if config.debug {
+                print("System Events shortcut failed: \(error.localizedDescription)")
+            }
+            return false
+        }
     }
 
     private func setControl(down: Bool) {
@@ -675,13 +751,13 @@ final class ControllerScrollApp: @unchecked Sendable {
         }
     }
 
-    private func postModifier(_ key: ModifierKey, down: Bool, flags: CGEventFlags) {
+    private func postModifier(_ key: ModifierKey, down: Bool, flags: CGEventFlags, tap: CGEventTapLocation? = nil) {
         guard let event = CGEvent(keyboardEventSource: nil, virtualKey: key.rawValue, keyDown: down) else {
             return
         }
 
         event.flags = flags
-        event.post(tap: config.eventTap)
+        event.post(tap: tap ?? config.eventTap)
     }
 
     private func postTestScroll() {
@@ -1157,6 +1233,8 @@ enum RemoteButton: Hashable {
     case b
     case x
     case y
+    case dpadLeft
+    case dpadRight
     case leftShoulder
     case rightShoulder
     case view
@@ -1234,6 +1312,10 @@ enum RemoteButton: Hashable {
             return "X"
         case .y:
             return "Y"
+        case .dpadLeft:
+            return "DPadLeft"
+        case .dpadRight:
+            return "DPadRight"
         case .leftShoulder:
             return "LB"
         case .rightShoulder:
@@ -1283,6 +1365,8 @@ enum KeyCode: CGKeyCode {
     case escape = 53
     case leftBracket = 33
     case rightBracket = 30
+    case leftArrow = 123
+    case rightArrow = 124
     case upArrow = 126
     case delete = 51
 }
